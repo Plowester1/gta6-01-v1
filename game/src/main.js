@@ -1,50 +1,109 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// Boot and the one loop: input every frame, the world advances in fixed
+// 1/60 s steps, and the renderer paints what is there. Screens: title,
+// play, paused, wasted, busted. ?shot=chase|street|mission|city stages a
+// screenshot scene instead of running the loop, paints it twice and sets
+// window.__shotReady.
+import { STEP, WORLD } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { generateCity, districtAt } from './city.js';
+import { createInput, makeEdge } from './input.js';
+import { createPlayer, stepPlayer, exitCar, addWanted } from './player.js';
+import { spawnCar, driveCar, stepParticles } from './vehicles.js';
+import { spawnTraffic, stepTraffic } from './traffic.js';
+import { spawnPeds, stepPeds } from './pedestrians.js';
+import { stepPolice } from './police.js';
+import { createMissionState, stepMissions } from './missions.js';
+import { stepCombat } from './combat.js';
+import { createAudio } from './audio.js';
+import { saveGame, loadGame } from './save.js';
+import { createRenderer, SCREEN_TITLE, SCREEN_PLAY, SCREEN_PAUSED, SCREEN_OVER, SCREEN_BUSTED } from './render.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
-
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number.isInteger(seedParam) ? seedParam : 1;
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const rng = createRandom(seed);
+const city = generateCity(createRandom(seed));
+const audio = createAudio();
+
+const G = {
+  rng, city, audio, time: 0, screen: SCREEN_TITLE,
+  player: createPlayer(1400, 900), mission: createMissionState(),
+  cars: [], peds: [], cops: [], bullets: [], particles: [], pickups: [], skid: [],
+  camera: { x: 800, y: 600, zoom: 1 }, cameraLock: false,
+  shake: 0, message: '', messageT: 0, district: 'Downtown',
+  gunshotT: 0, muzzleT: 0, fireCd: 0, spawnT: 0, roadblockT: 0,
+  policeAlert: 0, bustedReason: '', saveT: 0,
+  stats: { carsStolen: 0, missionsDone: 0 },
+};
+
+// Debug handle for automated checks (harmless in play).
+window.__solmarina = G;
+
+function resetWorld() {
+  G.cars.length = 0; G.peds.length = 0; G.cops.length = 0;
+  G.bullets.length = 0; G.particles.length = 0; G.pickups.length = 0; G.skid.length = 0;
+  G.player = createPlayer(1400, 900);
+  G.mission = createMissionState();
+  G.time = 0; G.shake = 0; G.message = ''; G.messageT = 0;
+  G.gunshotT = 0; G.muzzleT = 0; G.fireCd = 0; G.spawnT = 0; G.roadblockT = 0;
+  G.policeAlert = 0; G.bustedReason = '';
+  G.camera.x = 800; G.camera.y = 600; G.camera.zoom = 1; G.cameraLock = false;
+  // Parked cars around the spawn, plus ambient traffic and pedestrians.
+  spawnCar(G, 'sedan', 1450, 940, Math.PI / 2, 'parked');
+  spawnCar(G, 'taxi', 1350, 860, 0, 'parked');
+  spawnCar(G, 'van', 1560, 1100, Math.PI, 'parked');
+  spawnCar(G, 'sports', 1200, 1400, Math.PI / 2, 'parked');
+  spawnTraffic(G, 12);
+  spawnPeds(G, 20);
+  G.pickups.push({ x: 1450, y: 850, kind: 'ammo' });
+}
+G.reset = resetWorld;
+
+function stepWorld(dt, input, edge) {
+  const p = G.player;
+  G.time += dt;
+  if (G.messageT > 0) G.messageT -= dt;
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 30);
+  G.district = districtAt(p.x, p.y);
+  if (p.inCar) {
+    driveCar(G, p.inCar, dt, input);
+    if (edge && edge('KeyE')) exitCar(G);
+    audio.engine(p.inCar.speed, 470);
+  } else {
+    stepPlayer(G, dt, input, edge || (() => false));
+    audio.engine(0, 470);
+  }
+  stepTraffic(G, dt);
+  stepPeds(G, dt);
+  stepPolice(G, dt);
+  stepMissions(G, dt);
+  stepCombat(G, dt, input);
+  stepParticles(G, dt);
+  if (p.health <= 0 && G.screen === SCREEN_PLAY) {
+    G.screen = SCREEN_OVER;
+    G.bustedReason = 'Wasted. Solmarina is unforgiving.';
+  }
+  if (G.screen === SCREEN_PLAY) {
+    G.saveT += dt;
+    if (G.saveT > 12) { G.saveT = 0; saveGame(G); }
+  }
+}
+
+// The game loop and the screenshot path (main.js part 2).
 const renderer = createRenderer(canvas);
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
 function runShot(name) {
-  const scene = stageShot(name, world);
+  resetWorld();
+  const screen = stageShot(G, name, (dt, input) => stepWorld(dt, input, null));
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(G, screen);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -54,79 +113,68 @@ function runShot(name) {
 
 function runGame() {
   const input = createInput(canvas);
+  const edge = makeEdge(input);
   let screen = SCREEN_TITLE;
-  let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  resetWorld();
+  // Continue a previous visit if there is a save.
+  const hadSave = loadGame(G);
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
+  function announce(message) { status.textContent = message; }
 
   function startGame() {
-    world.reset();
-    accumulator = 0;
+    resetWorld();
+    G.screen = SCREEN_PLAY;
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    accumulator = 0;
+    audio.unlock();
+    announce('Playing SOLMARINA.');
   }
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+  function handleKeys() {
+    if (edge('Enter')) {
+      if (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_BUSTED) startGame();
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
+    if (edge('KeyC') && screen === SCREEN_TITLE && hadSave) {
+      G.screen = SCREEN_PLAY;
       screen = SCREEN_PLAY;
-      announce('Playing.');
+      audio.unlock();
+      announce('Continuing saved game.');
     }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
+    if (edge('Escape') || edge('KeyP')) {
+      if (screen === SCREEN_PLAY) { screen = SCREEN_PAUSED; G.screen = SCREEN_PAUSED; announce('Paused.'); }
+      else if (screen === SCREEN_PAUSED) { screen = SCREEN_PLAY; G.screen = SCREEN_PLAY; announce('Playing.'); }
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    if (edge('KeyM')) audio.setMuted(!audio.isMuted());
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+    handleKeys();
+    G.screen = screen;
+    if (screen === SCREEN_PLAY) {
+      while (accumulator >= STEP) {
+        stepWorld(STEP, input, edge);
         accumulator -= STEP;
+        if (G.screen !== SCREEN_PLAY) { screen = G.screen; break; }
       }
     } else {
       accumulator = 0;
+      if (screen === SCREEN_TITLE) G.time += STEP;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(G, screen);
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
+      screen = SCREEN_PAUSED; G.screen = SCREEN_PAUSED; announce('Paused.');
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('SOLMARINA. Press Enter to start.');
   requestAnimationFrame(frame);
 }
 
